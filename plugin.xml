@@ -9,8 +9,8 @@
     <description>Bluetooth Serial Communication Plugin</description>
     <license>Apache 2.0</license>
     <keywords>bluetooth, BLE, arduino</keywords>
-    <repo>https://github.com/don/BluetoothSerial.git</repo>
-    <issue>https://github.com/don/BluetoothSerial/issues</issue>
+    <repo>https://github.com/Suezenv/OutSystemsBluetoothSerial.git</repo>
+    <issue>https://github.com/Suezenv/OutSystemsBluetoothSerial/issues</issue>
 
     <js-module src="www/bluetoothSerial.js" name="bluetoothSerial">
         <clobbers target="window.bluetoothSerial" />
@@ -31,8 +31,8 @@
 
         <config-file target="AndroidManifest.xml" parent="/manifest">
             <!-- Request legacy Bluetooth permissions on older devices. -->
-            <uses-permission android:name="android.permission.BLUETOOTH" />
-            <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
+            <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+            <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
 
             <!-- Needed to looks for Bluetooth devices.-->
             <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
@@ -40,11 +40,9 @@
             <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
             <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 			
-			<!--If your app supports a service and can run on Android 10 (API level 29) or Android 11, you must also declare the ACCESS_BACKGROUND_LOCATION permission to discover Bluetooth devices. -->
-			<uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
-			
             <uses-feature android:name="android.hardware.bluetooth" android:required="true"/>
-            <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
+            <!-- Android uses Bluetooth Classic (SPP); BLE is not needed on this platform -->
+            <uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>
 
             <!-- Needed only if your app uses Bluetooth scan results to derive physical location. -->
 			
@@ -55,10 +53,7 @@
 		 
             <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
             <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
-			
-			 <!-- Since Bluetooth is a basic requirement for our app -->
-    <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
-            
+
         </config-file>
 
     </platform>

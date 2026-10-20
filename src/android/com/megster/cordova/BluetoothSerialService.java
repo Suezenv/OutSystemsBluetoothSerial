@@ -3,6 +3,7 @@ package com.megster.cordova;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
 import java.util.UUID;
 import java.util.Arrays;
 
@@ -28,7 +29,7 @@ public class BluetoothSerialService {
 
     // Debugging
     private static final String TAG = "BluetoothSerialService";
-    private static final boolean D = true;
+    private static final boolean D = false;
 
     // Name for the SDP record when creating server socket
     private static final String NAME_SECURE = "PhoneGapBluetoothSerialServiceSecure";
@@ -165,7 +166,8 @@ public class BluetoothSerialService {
         // Send the name of the connected device back to the UI Activity
         Message msg = mHandler.obtainMessage(BluetoothSerial.MESSAGE_DEVICE_NAME);
         Bundle bundle = new Bundle();
-        bundle.putString(BluetoothSerial.DEVICE_NAME, device.getName());
+        String deviceName = device.getName();
+        bundle.putString(BluetoothSerial.DEVICE_NAME, deviceName != null ? deviceName : device.getAddress());
         msg.setData(bundle);
         mHandler.sendMessage(msg);
 
@@ -203,28 +205,32 @@ public class BluetoothSerialService {
     /**
      * Write to the ConnectedThread in an unsynchronized manner
      * @param out The bytes to write
+     * @return true if the bytes were written, false if not connected or the write failed
      * @see ConnectedThread#write(byte[])
      */
-    public void write(byte[] out) {
+    public boolean write(byte[] out) {
         // Create temporary object
         ConnectedThread r;
         // Synchronize a copy of the ConnectedThread
         synchronized (this) {
-            if (mState != STATE_CONNECTED) return;
+            if (mState != STATE_CONNECTED) return false;
             r = mConnectedThread;
         }
         // Perform the write unsynchronized
-        r.write(out);
+        return r != null && r.write(out);
     }
 
     /**
      * Indicate that the connection attempt failed and notify the UI Activity.
+     * @param message  The error sent to the connect callback; starts with "Unable to connect to device"
      */
-    private void connectionFailed() {
+    private void connectionFailed(String message) {
+        Log.e(TAG, message);
+
         // Send a failure message back to the Activity
         Message msg = mHandler.obtainMessage(BluetoothSerial.MESSAGE_TOAST);
         Bundle bundle = new Bundle();
-        bundle.putString(BluetoothSerial.TOAST, "Unable to connect to device");
+        bundle.putString(BluetoothSerial.TOAST, message);
         msg.setData(bundle);
         mHandler.sendMessage(msg);
 
@@ -335,12 +341,14 @@ public class BluetoothSerialService {
      * succeeds or fails.
      */
     private class ConnectThread extends Thread {
-        private /*final*/ BluetoothSocket mmSocket;
+        private volatile BluetoothSocket mmSocket;
         private final BluetoothDevice mmDevice;
+        private final boolean mSecure;
         private String mSocketType;
 
         public ConnectThread(BluetoothDevice device, boolean secure) {
             mmDevice = device;
+            mSecure = secure;
             BluetoothSocket tmp = null;
             mSocketType = secure ? "Secure" : "Insecure";
 
@@ -354,7 +362,10 @@ public class BluetoothSerialService {
                     tmp = device.createInsecureRfcommSocketToServiceRecord(UUID_SPP);
                 }
             } catch (IOException e) {
-                Log.e(TAG, "Socket Type: " + mSocketType + "create() failed", e);
+                Log.e(TAG, "Socket Type: " + mSocketType + " create() failed", e);
+            } catch (SecurityException e) {
+                // Android 12+ without BLUETOOTH_CONNECT
+                Log.e(TAG, "Socket Type: " + mSocketType + " create() not permitted", e);
             }
             mmSocket = tmp;
         }
@@ -363,8 +374,18 @@ public class BluetoothSerialService {
             Log.i(TAG, "BEGIN mConnectThread SocketType:" + mSocketType);
             setName("ConnectThread" + mSocketType);
 
+            if (mmSocket == null) {
+                connectionFailed(failureMessage("could not create " + mSocketType + " socket"));
+                return;
+            }
+
             // Always cancel discovery because it will slow down a connection
-            mAdapter.cancelDiscovery();
+            try {
+                mAdapter.cancelDiscovery();
+            } catch (SecurityException e) {
+                // Android 12+ without BLUETOOTH_SCAN; connecting can still work
+                Log.w(TAG, "cancelDiscovery() not permitted", e);
+            }
 
             // Make a connection to the BluetoothSocket
             try {
@@ -372,24 +393,27 @@ public class BluetoothSerialService {
                 Log.i(TAG,"Connecting to socket...");
                 mmSocket.connect();
                 Log.i(TAG,"Connected");
+            } catch (SecurityException e) {
+                Log.e(TAG, "connect() not permitted", e);
+                closeSocket();
+                connectionFailed(failureMessage("Bluetooth connect permission is missing"));
+                return;
             } catch (IOException e) {
-                Log.e(TAG, e.toString());
+                Log.e(TAG, "connect() failed", e);
+                // Close the failed socket before opening another one to the same device
+                closeSocket();
 
                 // Some 4.1 devices have problems, try an alternative way to connect
                 // See https://github.com/don/BluetoothSerial/issues/89
                 try {
                     Log.i(TAG,"Trying fallback...");
-                    mmSocket = (BluetoothSocket) mmDevice.getClass().getMethod("createRfcommSocket", new Class[] {int.class}).invoke(mmDevice,1);
+                    mmSocket = createFallbackSocket();
                     mmSocket.connect();
                     Log.i(TAG,"Connected");
                 } catch (Exception e2) {
-                    Log.e(TAG, "Couldn't establish a Bluetooth connection.");
-                    try {
-                        mmSocket.close();
-                    } catch (IOException e3) {
-                        Log.e(TAG, "unable to close() " + mSocketType + " socket during connection failure", e3);
-                    }
-                    connectionFailed();
+                    Log.e(TAG, "Couldn't establish a Bluetooth connection.", e2);
+                    closeSocket();
+                    connectionFailed(failureMessage(describe(e) + " (fallback: " + describe(e2) + ")"));
                     return;
                 }
             }
@@ -403,12 +427,55 @@ public class BluetoothSerialService {
             connected(mmSocket, mmDevice, mSocketType);
         }
 
-        public void cancel() {
+        /**
+         * Hidden BluetoothDevice API that connects straight to RFCOMM channel 1, skipping the SDP lookup.
+         * The insecure variant is used for connectInsecure so the fallback does not force pairing.
+         */
+        private BluetoothSocket createFallbackSocket() throws Exception {
+            if (!mSecure) {
+                try {
+                    return (BluetoothSocket) mmDevice.getClass().getMethod("createInsecureRfcommSocket", new Class[] {int.class}).invoke(mmDevice, 1);
+                } catch (NoSuchMethodException e) {
+                    Log.w(TAG, "createInsecureRfcommSocket not available, using createRfcommSocket");
+                }
+            }
+            return (BluetoothSocket) mmDevice.getClass().getMethod("createRfcommSocket", new Class[] {int.class}).invoke(mmDevice, 1);
+        }
+
+        private String failureMessage(String reason) {
+            return "Unable to connect to device (" + bondState() + "): " + reason;
+        }
+
+        private String bondState() {
             try {
-                mmSocket.close();
+                switch (mmDevice.getBondState()) {
+                    case BluetoothDevice.BOND_BONDED: return "paired";
+                    case BluetoothDevice.BOND_BONDING: return "pairing";
+                    default: return "not paired";
+                }
+            } catch (SecurityException e) {
+                return "pairing state unknown";
+            }
+        }
+
+        private String describe(Exception e) {
+            // Reflection wraps the real error
+            Throwable cause = (e instanceof InvocationTargetException && e.getCause() != null) ? e.getCause() : e;
+            return cause.getClass().getSimpleName() + ": " + cause.getMessage();
+        }
+
+        private void closeSocket() {
+            BluetoothSocket socket = mmSocket;
+            if (socket == null) return;
+            try {
+                socket.close();
             } catch (IOException e) {
                 Log.e(TAG, "close() of connect " + mSocketType + " socket failed", e);
             }
+        }
+
+        public void cancel() {
+            closeSocket();
         }
     }
 
@@ -444,11 +511,22 @@ public class BluetoothSerialService {
             byte[] buffer = new byte[1024];
             int bytes;
 
+            if (mmInStream == null) {
+                connectionLost();
+                return;
+            }
+
             // Keep listening to the InputStream while connected
             while (true) {
                 try {
                     // Read from the InputStream
                     bytes = mmInStream.read(buffer);
+                    if (bytes < 0) {
+                        throw new IOException("Input stream closed");
+                    }
+                    if (bytes == 0) {
+                        continue;
+                    }
                     String data = new String(buffer, 0, bytes);
 
                     // Send the new data String to the UI Activity
@@ -457,16 +535,13 @@ public class BluetoothSerialService {
                     // Send the raw bytestream to the UI Activity.
                     // We make a copy because the full array can have extra data at the end
                     // when / if we read less than its size.
-                    if (bytes > 0) {
-                        byte[] rawdata = Arrays.copyOf(buffer, bytes);
-                        mHandler.obtainMessage(BluetoothSerial.MESSAGE_READ_RAW, rawdata).sendToTarget();
-                    }
+                    byte[] rawdata = Arrays.copyOf(buffer, bytes);
+                    mHandler.obtainMessage(BluetoothSerial.MESSAGE_READ_RAW, rawdata).sendToTarget();
 
                 } catch (IOException e) {
                     Log.e(TAG, "disconnected", e);
+                    // connectionLost() also restarts the service
                     connectionLost();
-                    // Start the service over to restart listening mode
-                    BluetoothSerialService.this.start();
                     break;
                 }
             }
@@ -475,16 +550,21 @@ public class BluetoothSerialService {
         /**
          * Write to the connected OutStream.
          * @param buffer  The bytes to write
+         * @return true if the bytes were written
          */
-        public void write(byte[] buffer) {
+        public boolean write(byte[] buffer) {
+            if (mmOutStream == null) return false;
             try {
                 mmOutStream.write(buffer);
 
                 // Share the sent message back to the UI Activity
                 mHandler.obtainMessage(BluetoothSerial.MESSAGE_WRITE, -1, -1, buffer).sendToTarget();
+                return true;
 
             } catch (IOException e) {
                 Log.e(TAG, "Exception during write", e);
+                connectionLost();
+                return false;
             }
         }
 
